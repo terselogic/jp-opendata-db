@@ -40,9 +40,3 @@ JOIN permits p ON c.corporate_number = p.corporate_number
 JOIN spatial_profiles s ON c.corporate_number = s.corporate_number
 LIMIT 10;
 ```
-
-## フル統合版（有償商用ライセンス）
-
-本リポジトリの `sample/`（2,000社）でスキーマ・SQL結合をご確認のうえ、フル統合版（東京都全法人 1,373,848社 × 位置参照情報ジオコーディング 109万社 × L01地価公示 × 厚労省介護・金融庁許認可 4,625件 × EDINET企業財務、および全国47都道府県版リリース時の無償アップグレード権）をご希望の場合は、以下よりご購入いただけます。
-
-- **購入ページ（Stripe Checkout / ¥19,800 買い切り）**: https://buy.stripe.com/3cI8wP7Qnf8C22b3EQ7AI02
