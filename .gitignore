@@ -1,0 +1,14 @@
+.DS_Store
+.env
+.venv/
+__pycache__/
+*.pyc
+data/
+dist/
+*.sqlite
+*.duckdb
+*.parquet
+!sample/*.sqlite
+!sample/*.duckdb
+!sample/*.parquet
+!sample/jp_opendata_sample_parquet/*.parquet
