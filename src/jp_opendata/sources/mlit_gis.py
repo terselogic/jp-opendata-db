@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import math
+import tempfile
+
 import duckdb
 import polars as pl
 
@@ -14,6 +17,59 @@ SPATIAL_SCHEMA: dict[str, pl.DataType] = {
     "nearest_land_price_yen_sqm": pl.Int64,
     "nearest_land_price_dist_m": pl.Float64,
 }
+
+
+def attach_nearest_land_price_fast(
+    geo_corps: pl.DataFrame,
+    land_price_points_df: pl.DataFrame,
+) -> pl.DataFrame:
+    """Find nearest land price point for 1M+ corporates via 0.05-deg spatial grid bucketing."""
+    lp_rows = land_price_points_df.select(["price_yen_sqm", "latitude", "longitude"]).to_dicts()
+    if not lp_rows:
+        return geo_corps.with_columns(
+            pl.lit(None, dtype=pl.Int64).alias("nearest_land_price_yen_sqm"),
+            pl.lit(None, dtype=pl.Float64).alias("nearest_land_price_dist_m"),
+        )
+
+    cell_deg = 0.05
+    grid: dict[tuple[int, int], list[tuple[float, float, int]]] = {}
+    all_points: list[tuple[float, float, int]] = []
+    for r in lp_rows:
+        lat, lon, price = float(r["latitude"]), float(r["longitude"]), int(r["price_yen_sqm"])
+        pt = (lat, lon, price)
+        all_points.append(pt)
+        gx, gy = math.floor(lat / cell_deg), math.floor(lon / cell_deg)
+        grid.setdefault((gx, gy), []).append(pt)
+
+    prices: list[int | None] = []
+    dists: list[float | None] = []
+    for row in geo_corps.select(["latitude", "longitude"]).to_dicts():
+        clat, clon = float(row["latitude"]), float(row["longitude"])
+        gx, gy = math.floor(clat / cell_deg), math.floor(clon / cell_deg)
+        cands: list[tuple[float, float, int]] = []
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                cands.extend(grid.get((gx + dx, gy + dy), ()))
+        if not cands:
+            cands = all_points
+
+        best_d2 = float("inf")
+        best_price: int | None = None
+        for plat, plon, price in cands:
+            dlat = (clat - plat) * 111000.0
+            dlon = (clon - plon) * 91000.0
+            d2 = dlat * dlat + dlon * dlon
+            if d2 < best_d2:
+                best_d2 = d2
+                best_price = price
+
+        prices.append(best_price)
+        dists.append(round(math.sqrt(best_d2), 2) if best_price is not None else None)
+
+    return geo_corps.with_columns(
+        pl.Series("nearest_land_price_yen_sqm", prices, dtype=pl.Int64),
+        pl.Series("nearest_land_price_dist_m", dists, dtype=pl.Float64),
+    )
 
 
 def enrich_corporates_spatial(
@@ -30,12 +86,31 @@ def enrich_corporates_spatial(
     if geo_corps.is_empty():
         return pl.DataFrame(schema=SPATIAL_SCHEMA)
 
-    # DuckDB 2.0 + pyarrow無し環境でも確実に動作するよう一時Parquet経由で読み込む
-    import tempfile
+    has_polygons = (
+        (zoning_polygons_df is not None and not zoning_polygons_df.is_empty())
+        or (hazard_polygons_df is not None and not hazard_polygons_df.is_empty())
+    )
+
+    if not has_polygons:
+        base_df = (
+            attach_nearest_land_price_fast(geo_corps, land_price_points_df)
+            if land_price_points_df is not None and not land_price_points_df.is_empty()
+            else geo_corps.with_columns(
+                pl.lit(None, dtype=pl.Int64).alias("nearest_land_price_yen_sqm"),
+                pl.lit(None, dtype=pl.Float64).alias("nearest_land_price_dist_m"),
+            )
+        )
+        return (
+            base_df.with_columns(
+                pl.lit(None, dtype=pl.String).alias("zoning_name"),
+                pl.lit(None, dtype=pl.String).alias("flood_hazard_rank"),
+            )
+            .select(list(SPATIAL_SCHEMA.keys()))
+            .sort("corporate_number")
+        )
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        tmp = tmpdir
-        corps_pq = f"{tmp}/corps.parquet"
+        corps_pq = f"{tmpdir}/corps.parquet"
         geo_corps.write_parquet(corps_pq)
 
         con = duckdb.connect(":memory:")
@@ -53,7 +128,7 @@ def enrich_corporates_spatial(
             zoning_sql = "NULL::VARCHAR AS zoning_name"
             zoning_join = ""
             if zoning_polygons_df is not None and not zoning_polygons_df.is_empty():
-                zp_pq = f"{tmp}/zoning.parquet"
+                zp_pq = f"{tmpdir}/zoning.parquet"
                 zoning_polygons_df.write_parquet(zp_pq)
                 con.execute(
                     f"""
@@ -68,7 +143,7 @@ def enrich_corporates_spatial(
             hazard_sql = "NULL::VARCHAR AS flood_hazard_rank"
             hazard_join = ""
             if hazard_polygons_df is not None and not hazard_polygons_df.is_empty():
-                hz_pq = f"{tmp}/hazard.parquet"
+                hz_pq = f"{tmpdir}/hazard.parquet"
                 hazard_polygons_df.write_parquet(hz_pq)
                 con.execute(
                     f"""
@@ -80,72 +155,33 @@ def enrich_corporates_spatial(
                 hazard_sql = "h.flood_hazard_rank"
                 hazard_join = "LEFT JOIN hazard h ON ST_Contains(h.geom, c.geom)"
 
-            if land_price_points_df is not None and not land_price_points_df.is_empty():
-                lp_pq = f"{tmp}/land_price.parquet"
-                land_price_points_df.write_parquet(lp_pq)
-                con.execute(
-                    f"""
-                    CREATE TABLE land_price AS
-                    SELECT price_yen_sqm,
-                           latitude AS lp_lat,
-                           longitude AS lp_lon
-                    FROM read_parquet('{lp_pq}')
-                    """
-                )
-                # Haversine近似（緯度35度付近のメートル換算）で最寄り地価公示点を取得
-                query = f"""
-                WITH base AS (
-                    SELECT c.corporate_number,
-                           c.latitude,
-                           c.longitude,
-                           {zoning_sql},
-                           {hazard_sql}
+            out_pq = f"{tmpdir}/poly_out.parquet"
+            con.execute(
+                f"""
+                COPY (
+                    SELECT c.corporate_number, c.latitude, c.longitude,
+                           {zoning_sql}, {hazard_sql}
                     FROM corps c
                     {zoning_join}
                     {hazard_join}
-                ),
-                ranked_lp AS (
-                    SELECT b.*,
-                           lp.price_yen_sqm AS nearest_land_price_yen_sqm,
-                           SQRT(
-                               POW((b.latitude - lp.lp_lat) * 111000.0, 2) +
-                               POW((b.longitude - lp.lp_lon) * 91000.0, 2)
-                           ) AS nearest_land_price_dist_m,
-                           ROW_NUMBER() OVER (
-                               PARTITION BY b.corporate_number
-                               ORDER BY POW(b.latitude - lp.lp_lat, 2) + POW(b.longitude - lp.lp_lon, 2)
-                           ) AS rn
-                    FROM base b
-                    CROSS JOIN land_price lp
-                )
-                SELECT corporate_number,
-                       latitude,
-                       longitude,
-                       zoning_name,
-                       flood_hazard_rank,
-                       CAST(nearest_land_price_yen_sqm AS BIGINT) AS nearest_land_price_yen_sqm,
-                       ROUND(nearest_land_price_dist_m, 2) AS nearest_land_price_dist_m
-                FROM ranked_lp
-                WHERE rn = 1
-                ORDER BY corporate_number
+                    ORDER BY c.corporate_number
+                ) TO '{out_pq}' (FORMAT PARQUET)
                 """
-            else:
-                query = f"""
-                SELECT c.corporate_number,
-                       c.latitude,
-                       c.longitude,
-                       {zoning_sql},
-                       {hazard_sql},
-                       NULL::BIGINT AS nearest_land_price_yen_sqm,
-                       NULL::DOUBLE AS nearest_land_price_dist_m
-                FROM corps c
-                {zoning_join}
-                {hazard_join}
-                ORDER BY c.corporate_number
-                """
-
-            out_pq = f"{tmp}/spatial_out.parquet"
-            con.execute(f"COPY ({query}) TO '{out_pq}' (FORMAT PARQUET)")
-            return pl.read_parquet(out_pq).cast(SPATIAL_SCHEMA)
+            )
+            poly_df = pl.read_parquet(out_pq)
         finally:
             con.close()
+
+    if land_price_points_df is not None and not land_price_points_df.is_empty():
+        lp_df = attach_nearest_land_price_fast(
+            poly_df.select(["corporate_number", "latitude", "longitude"]),
+            land_price_points_df,
+        ).select(["corporate_number", "nearest_land_price_yen_sqm", "nearest_land_price_dist_m"])
+        poly_df = poly_df.join(lp_df, on="corporate_number", how="left")
+    else:
+        poly_df = poly_df.with_columns(
+            pl.lit(None, dtype=pl.Int64).alias("nearest_land_price_yen_sqm"),
+            pl.lit(None, dtype=pl.Float64).alias("nearest_land_price_dist_m"),
+        )
+
+    return poly_df.select(list(SPATIAL_SCHEMA.keys())).cast(SPATIAL_SCHEMA)

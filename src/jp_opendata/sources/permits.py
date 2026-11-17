@@ -217,7 +217,9 @@ def load_fsa_excel_permits(
     col_idx: dict[str, int] = {}
     for row in rows_iter:
         cells = [str(c).replace("\n", "").strip() if c is not None else "" for c in row]
-        if "登録番号" in cells and ("法人番号" in cells or "本店等所在地" in cells):
+        has_reg = any(k in cells for k in ("登録番号", "免許番号", "許可番号"))
+        has_loc = any(k in cells for k in ("法人番号", "本店等所在地", "本店所在地", "所在地"))
+        if has_reg and has_loc:
             for idx, label in enumerate(cells):
                 if label:
                     col_idx[label] = idx
@@ -226,11 +228,21 @@ def load_fsa_excel_permits(
     if not col_idx:
         return []
 
-    reg_i = col_idx.get("登録番号")
+    reg_i = next(
+        (col_idx[k] for k in ("登録番号", "免許番号", "許可番号") if k in col_idx),
+        None,
+    )
     corp_i = col_idx.get("法人番号")
-    addr_i = col_idx.get("本店等所在地")
+    addr_i = next(
+        (col_idx[k] for k in ("本店等所在地", "本店所在地", "所在地") if k in col_idx),
+        None,
+    )
     name_i = next(
-        (idx for label, idx in col_idx.items() if label.endswith("名") or "商号" in label),
+        (
+            idx
+            for label, idx in col_idx.items()
+            if label.endswith("名") or "商号" in label or "名称" in label
+        ),
         None,
     )
     if reg_i is None or name_i is None:
