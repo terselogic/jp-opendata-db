@@ -73,7 +73,19 @@ def resolve_permits_to_corporates(
     if not permits:
         return pl.DataFrame(schema=PERMITS_SCHEMA)
 
-    corp_rows = corporates_df.to_dicts()
+    # Pre-filter corporates_df to only candidate rows relevant to permits (bounded memory for 5M+ rows)
+    explicit_cnums = {p.corporate_number for p in permits if p.corporate_number}
+    norm_names = {normalize_company_name(p.raw_company_name, strip_legal_form=False) for p in permits}
+    core_names = {normalize_company_name(p.raw_company_name, strip_legal_form=True) for p in permits}
+    filtered_corps = corporates_df.filter(
+        pl.col("corporate_number").is_in(list(explicit_cnums))
+        | pl.col("norm_name").is_in(list(norm_names))
+        | pl.col("core_name").is_in(list(core_names))
+    )
+
+    corp_rows = filtered_corps.select(
+        ["corporate_number", "norm_name", "core_name", "prefecture", "municipality", "street_key"]
+    ).to_dicts()
     known_corp_nums = {str(r["corporate_number"]) for r in corp_rows}
 
     # Tier 2: (norm_name, municipality, street_key) -> [corporate_number]

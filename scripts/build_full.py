@@ -1,8 +1,9 @@
-"""Production builder for jp-opendata-db full package (Phase 1: Tokyo full)."""
+"""Production builder for jp-opendata-db full package (Tokyo / All-Japan 47 prefectures)."""
 
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 from pathlib import Path
 import re
@@ -13,8 +14,8 @@ import zipfile
 import httpx
 import polars as pl
 
-from jp_opendata.exporter import export_integrated_db
-from jp_opendata.normalizer import normalize_address
+from jp_opendata.exporter import export_from_parquet_dir, export_integrated_db
+from jp_opendata.normalizer import normalize_address, normalize_company_name
 from jp_opendata.sources.edinet_bridge import build_edinet_bridge
 from jp_opendata.sources.mlit_gis import enrich_corporates_spatial
 from jp_opendata.sources.mlit_isj import geocode_corporates_with_isj
@@ -30,6 +31,7 @@ from jp_opendata.validator import SOURCES_METADATA_SCHEMA
 NTA_ZENKEN_URL = "https://www.houjin-bangou.nta.go.jp/pc/download/zenken/index.html"
 NTA_POST_URL = "https://www.houjin-bangou.nta.go.jp/download/zenken/index.html"
 MLIT_L01_TOKYO_URL = "https://nlftp.mlit.go.jp/ksj/gml/data/L01/L01-25/L01-25_13_GML.zip"
+MLIT_L01_ALL_URL = "https://nlftp.mlit.go.jp/ksj/gml/data/L01/L01-25/L01-25_GML.zip"
 MLIT_ISJ_GAIKU_TOKYO_URL = "https://nlftp.mlit.go.jp/isj/dls/data/24.0a/13000-24.0a.zip"
 MLIT_ISJ_OAZA_TOKYO_URL = "https://nlftp.mlit.go.jp/isj/dls/data/18.0b/13000-18.0b.zip"
 MHLW_OPENDATA_PAGE = "https://www.mhlw.go.jp/stf/kaigo-kouhyou_opendata.html"
@@ -307,15 +309,305 @@ def build_tokyo_full(root: Path, mhlw_limit: int = 8) -> Path:
     return zip_path
 
 
+def discover_nta_unicode_pref_files() -> tuple[dict[str, str], list[tuple[str, str, list[str]]]]:
+    """Fetch hidden form tokens and Unicode CSV file numbers for all 47 prefectures (01..47)."""
+    with httpx.Client(timeout=60.0, follow_redirects=True) as client:
+        page = client.get(NTA_ZENKEN_URL)
+        page.raise_for_status()
+    hiddens = dict(
+        re.findall(
+            r'<input[^>]+type=["\']hidden["\'][^>]+name=["\']([^"\']+)["\'][^>]+value=["\']([^"\']*)["\']',
+            page.text,
+        )
+    )
+    blocks = re.findall(r'<dt class="mb05">([^<]+)</dt>\s*<dd>(.*?)</dd>', page.text, re.S)
+    if len(blocks) < 97:
+        raise RuntimeError(f"Unexpected NTA zenken page structure: found {len(blocks)} blocks")
+    # blocks[49..97] is the Unicode CSV section: 49=全国, 50=北海道 .. 96=沖縄県, 97=国外
+    unicode_prefs = blocks[50:97]
+    if unicode_prefs[0][0].strip() != "北海道" or unicode_prefs[-1][0].strip() != "沖縄県":
+        raise RuntimeError(
+            f"Unexpected prefecture bounds: {unicode_prefs[0][0]} .. {unicode_prefs[-1][0]}"
+        )
+    entries: list[tuple[str, str, list[str]]] = []
+    for idx, (pref_name, body) in enumerate(unicode_prefs, start=1):
+        file_nos = re.findall(r"doDownload\((\d+)\)", body)
+        entries.append((f"{idx:02d}", pref_name.strip(), file_nos))
+    return hiddens, entries
+
+
+def download_nta_file(
+    client: httpx.Client, hiddens: dict[str, str], file_no: str, dest: Path
+) -> Path:
+    """POST to NTA zenken endpoint to download a single ZIP archive."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    payload = {**hiddens, "selDlFileNo": file_no}
+    resp = client.post(NTA_POST_URL, data=payload)
+    resp.raise_for_status()
+    dest.write_bytes(resp.content)
+    return dest
+
+
+def build_national_full(root: Path, mhlw_limit: int = 8) -> Path:
+    """Build full All-Japan (47 prefectures) integrated DB package with low-disk/low-RAM streaming."""
+    raw_dir = root / "data" / "raw_all"
+    work_dir = root / "data" / "work_all"
+    pkg_dir = root / "data" / "out" / "jp_opendata_all_full_v1"
+    dist_dir = root / "dist"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    dist_dir.mkdir(parents=True, exist_ok=True)
+
+    hiddens, pref_entries = discover_nta_unicode_pref_files()
+    print(f"Discovered {len(pref_entries)} prefectures from NTA Unicode CSV section.")
+
+    # Step 1: Prefecture-by-prefecture NTA + ISJ geocoding -> intermediate Parquet (delete raw ZIPs immediately)
+    with httpx.Client(timeout=180.0, follow_redirects=True) as client:
+        for pref_code, pref_name, file_nos in pref_entries:
+            corps_pq = work_dir / f"corps_{pref_code}.parquet"
+            if corps_pq.exists():
+                print(f"[{pref_code}/47 {pref_name}] Already built, skipping.")
+                continue
+
+            print(f"[{pref_code}/47 {pref_name}] Downloading {len(file_nos)} NTA archive(s)...")
+            pref_dfs: list[pl.DataFrame] = []
+            for part_idx, fno in enumerate(file_nos, start=1):
+                nta_zip = raw_dir / f"nta_{pref_code}_p{part_idx}.zip"
+                download_nta_file(client, hiddens, fno, nta_zip)
+                pref_dfs.append(load_nta_corporates(nta_zip, limit=None))
+                nta_zip.unlink(missing_ok=True)
+
+            corps_df = pl.concat(pref_dfs).unique(subset=["corporate_number"], keep="first")
+            del pref_dfs
+
+            gaiku_zip = raw_dir / f"{pref_code}000-24.0a.zip"
+            oaza_zip = raw_dir / f"{pref_code}000-18.0b.zip"
+            gaiku_url = f"https://nlftp.mlit.go.jp/isj/dls/data/24.0a/{pref_code}000-24.0a.zip"
+            oaza_url = f"https://nlftp.mlit.go.jp/isj/dls/data/18.0b/{pref_code}000-18.0b.zip"
+            download_file(gaiku_url, gaiku_zip)
+            download_file(oaza_url, oaza_zip)
+
+            corps_geo = geocode_corporates_with_isj(corps_df, gaiku_zip, oaza_zip)
+            gaiku_zip.unlink(missing_ok=True)
+            oaza_zip.unlink(missing_ok=True)
+            del corps_df
+
+            geo_cnt = corps_geo.filter(pl.col("latitude").is_not_null()).height
+            print(
+                f"[{pref_code}/47 {pref_name}] Corps: {corps_geo.height:,} | Geocoded: {geo_cnt:,} ({geo_cnt / max(corps_geo.height, 1):.1%})"
+            )
+            corps_geo.write_parquet(corps_pq, compression="zstd")
+            del corps_geo
+            gc.collect()
+
+    # Step 2: National MLIT L01-25 land prices -> spatial enrichment per prefecture
+    print("Downloading & parsing national MLIT L01-25 land prices...")
+    l01_zip = download_file(MLIT_L01_ALL_URL, raw_dir / "L01-25_GML.zip")
+    l01_points = parse_mlit_l01_gml(l01_zip).select(["price_yen_sqm", "latitude", "longitude"])
+    l01_zip.unlink(missing_ok=True)
+    print(f"Loaded {l01_points.height:,} national L01 land price points.")
+
+    for pref_code, pref_name, _ in pref_entries:
+        spatial_pq = work_dir / f"spatial_{pref_code}.parquet"
+        if spatial_pq.exists():
+            continue
+        corps_geo = pl.read_parquet(
+            work_dir / f"corps_{pref_code}.parquet",
+            columns=["corporate_number", "latitude", "longitude"],
+        )
+        sp_df = enrich_corporates_spatial(corps_geo, land_price_points_df=l01_points)
+        sp_df.write_parquet(spatial_pq, compression="zstd")
+        del corps_geo, sp_df
+    del l01_points
+    gc.collect()
+
+    # Step 3: National MHLW Care & FSA permits (no prefecture filter)
+    print(f"Downloading & loading national MHLW Care Service CSVs (top {mhlw_limit} services)...")
+    permit_records: list[PermitRecord] = []
+    for url in discover_mhlw_kaigo_csvs(limit=mhlw_limit):
+        fname = url.rsplit("/", 1)[-1]
+        csv_path = download_file(url, raw_dir / fname)
+        permit_records.extend(load_mhlw_kaigo_permits(csv_path, prefecture_filter=None))
+        csv_path.unlink(missing_ok=True)
+
+    print("Downloading & loading national FSA licensed-operator Excel lists...")
+    for url, category in FSA_EXCEL_TARGETS:
+        fname = "fsa_" + url.rsplit("/", 1)[-1]
+        xlsx_path = download_file(url, raw_dir / fname)
+        permit_records.extend(
+            load_fsa_excel_permits(xlsx_path, category, prefecture_filter=None)
+        )
+        xlsx_path.unlink(missing_ok=True)
+
+    deduped_permits = list({p.permit_id: p for p in permit_records}.values())
+    del permit_records
+    print(f"Resolving {len(deduped_permits):,} national permits against corporate index...")
+    explicit_cnums = list({p.corporate_number for p in deduped_permits if p.corporate_number})
+    norm_names = list(
+        {normalize_company_name(p.raw_company_name, strip_legal_form=False) for p in deduped_permits}
+    )
+    core_names = list(
+        {normalize_company_name(p.raw_company_name, strip_legal_form=True) for p in deduped_permits}
+    )
+    cand_corps_df = (
+        pl.scan_parquet(str(work_dir / "corps_*.parquet"))
+        .select(
+            ["corporate_number", "norm_name", "core_name", "prefecture", "municipality", "street_key"]
+        )
+        .filter(
+            pl.col("corporate_number").is_in(explicit_cnums)
+            | pl.col("norm_name").is_in(norm_names)
+            | pl.col("core_name").is_in(core_names)
+        )
+        .collect()
+    )
+    permits_df = resolve_permits_to_corporates(deduped_permits, cand_corps_df)
+    del deduped_permits, cand_corps_df
+    gc.collect()
+
+    # Step 4: EDINET bridge
+    edinet_parquet = root.parent / "edinet-pit-dataset" / "data" / "out" / "edinet_pit_cohort.parquet"
+    if edinet_parquet.exists():
+        ed_filers = (
+            pl.scan_parquet(edinet_parquet)
+            .select("filer_name")
+            .unique()
+            .collect()["filer_name"]
+            .to_list()
+        )
+        ed_norms = [normalize_company_name(str(f or ""), strip_legal_form=False) for f in ed_filers]
+        ed_cores = [normalize_company_name(str(f or ""), strip_legal_form=True) for f in ed_filers]
+        ed_corps_df = (
+            pl.scan_parquet(str(work_dir / "corps_*.parquet"))
+            .select(["corporate_number", "norm_name", "core_name"])
+            .filter(pl.col("norm_name").is_in(ed_norms) | pl.col("core_name").is_in(ed_cores))
+            .collect()
+        )
+        edinet_df = build_edinet_bridge(edinet_parquet, ed_corps_df)
+        del ed_corps_df
+    else:
+        edinet_df = build_edinet_bridge(edinet_parquet, pl.DataFrame())
+
+    sources_df = pl.DataFrame(
+        [
+            {
+                "source_id": "nta_corp",
+                "source_name": "国税庁法人番号公表サイト（全国47都道府県 Unicode CSV）",
+                "publisher": "国税庁",
+                "license_name": "公共データ利用規約（第1.0版）",
+                "source_url": NTA_ZENKEN_URL,
+                "retrieved_date": "2026-11-18",
+            },
+            {
+                "source_id": "mlit_isj",
+                "source_name": "国土交通省 位置参照情報（全国47都道府県 街区24.0a・大字町丁目18.0b）",
+                "publisher": "国土交通省",
+                "license_name": "位置参照情報利用約款（商用・有償二次配布可）",
+                "source_url": "https://nlftp.mlit.go.jp/isj/",
+                "retrieved_date": "2026-11-18",
+            },
+            {
+                "source_id": "mlit_l01",
+                "source_name": "国土数値情報 地価公示データ（全国 L01-25）",
+                "publisher": "国土交通省",
+                "license_name": "国土数値情報利用約款（L01商用可）",
+                "source_url": MLIT_L01_ALL_URL,
+                "retrieved_date": "2026-11-18",
+            },
+            {
+                "source_id": "mhlw_kaigo",
+                "source_name": "介護サービス情報公表システム オープンデータ（全国・複数サービス種別）",
+                "publisher": "厚生労働省",
+                "license_name": "CC BY 4.0 / 厚生労働省利用規約",
+                "source_url": MHLW_OPENDATA_PAGE,
+                "retrieved_date": "2026-11-18",
+            },
+            {
+                "source_id": "fsa_menkyo",
+                "source_name": "免許・許可・登録等を受けている業者一覧（金融庁Excel一括・全国）",
+                "publisher": "金融庁",
+                "license_name": "政府標準利用規約（第2.0版）準拠",
+                "source_url": "https://www.fsa.go.jp/menkyo/menkyo.html",
+                "retrieved_date": "2026-11-18",
+            },
+        ],
+        schema=SOURCES_METADATA_SCHEMA,
+    )
+
+    # Step 5: Stream-merge intermediate Parquets into pkg_dir and delete work_dir/raw_dir
+    if pkg_dir.exists():
+        shutil.rmtree(pkg_dir)
+    parquet_dir = pkg_dir / "jp_opendata_all_full_parquet"
+    parquet_dir.mkdir(parents=True, exist_ok=True)
+
+    print("Consolidating national Parquet tables...")
+    pl.scan_parquet(str(work_dir / "corps_*.parquet")).unique(
+        subset=["corporate_number"], keep="first"
+    ).sink_parquet(parquet_dir / "corporates.parquet", compression="zstd")
+    pl.scan_parquet(str(work_dir / "spatial_*.parquet")).unique(
+        subset=["corporate_number"], keep="first"
+    ).sort("corporate_number").sink_parquet(
+        parquet_dir / "spatial_profiles.parquet", compression="zstd"
+    )
+    permits_df.write_parquet(parquet_dir / "permits.parquet", compression="zstd")
+    edinet_df.write_parquet(parquet_dir / "edinet_links.parquet", compression="zstd")
+    sources_df.write_parquet(parquet_dir / "_metadata_sources.parquet", compression="zstd")
+    del permits_df, edinet_df, sources_df
+    gc.collect()
+
+    shutil.rmtree(work_dir, ignore_errors=True)
+    shutil.rmtree(raw_dir, ignore_errors=True)
+
+    # Step 6: Validate and export DuckDB + SQLite from Parquet
+    print("Validating & exporting DuckDB + SQLite...")
+    _, report = export_from_parquet_dir(
+        output_dir=pkg_dir,
+        parquet_dir=parquet_dir,
+        name="jp_opendata_all_full",
+    )
+
+    attribution_txt = "\n".join(
+        [
+            "jp-opendata-db All-Japan Full Package (v1)",
+            "All datasets included comply with commercial redistribution terms:",
+            "- 国税庁法人番号公表サイト（全国47都道府県）: 公共データ利用規約（第1.0版）",
+            "- 国土交通省 位置参照情報（24.0a / 18.0b 全国47都道府県）: 位置参照情報利用約款（出典明記で有償二次配布可）",
+            "- 国土交通省 国土数値情報 地価公示（L01-25 全国）: 国土数値情報利用約款（L01商用可）",
+            "- 厚生労働省 介護サービス情報公表システム オープンデータ: CC BY 4.0",
+            "- 金融庁 免許・許可・登録等を受けている業者一覧: 政府標準利用規約（第2.0版）準拠",
+            "",
+            report.to_markdown(),
+        ]
+    )
+    (pkg_dir / "LICENSE_ATTRIBUTIONS.txt").write_text(attribution_txt + "\n", encoding="utf-8")
+
+    # Step 7: Create distributable ZIP + SHA-256, then clean up expanded pkg_dir
+    zip_base = dist_dir / "jp_opendata_all_full_v1"
+    zip_path = Path(shutil.make_archive(str(zip_base), "zip", root_dir=pkg_dir))
+    with zip_path.open("rb") as f:
+        sha256 = hashlib.file_digest(f, "sha256").hexdigest()
+    (dist_dir / "jp_opendata_all_full_v1.zip.sha256").write_text(
+        f"{sha256}  {zip_path.name}\n", encoding="utf-8"
+    )
+    shutil.rmtree(pkg_dir, ignore_errors=True)
+
+    print(report.to_markdown())
+    print(f"Distributable ZIP: {zip_path} ({zip_path.stat().st_size / (1024 * 1024):.1f} MB)")
+    print(f"SHA-256: {sha256}")
+    return zip_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scope", choices=["tokyo"], default="tokyo")
+    parser.add_argument("--scope", choices=["tokyo", "all"], default="tokyo")
     parser.add_argument("--mhlw-limit", type=int, default=8)
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parent.parent
     if args.scope == "tokyo":
         build_tokyo_full(root, mhlw_limit=args.mhlw_limit)
+    elif args.scope == "all":
+        build_national_full(root, mhlw_limit=args.mhlw_limit)
 
 
 if __name__ == "__main__":

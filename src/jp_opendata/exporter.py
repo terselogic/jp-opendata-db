@@ -9,7 +9,7 @@ import sqlite3
 import duckdb
 import polars as pl
 
-from jp_opendata.validator import QualityReport, validate_dataset
+from jp_opendata.validator import QualityReport, validate_dataset, validate_parquet_dir
 
 
 def _polars_to_sqlite_type(dtype: pl.DataType) -> str:
@@ -20,49 +20,121 @@ def _polars_to_sqlite_type(dtype: pl.DataType) -> str:
     return "TEXT"
 
 
+def _insert_df_chunks_sqlite(
+    con: sqlite3.Connection, tbl_name: str, df: pl.DataFrame, chunk_size: int = 50_000
+) -> None:
+    if df.is_empty():
+        return
+    placeholders = ", ".join("?" for _ in df.columns)
+    sql = f'INSERT INTO "{tbl_name}" VALUES ({placeholders})'
+    has_temporal = any(dt in (pl.Date, pl.Datetime) for dt in df.schema.values())
+    for chunk in df.iter_slices(chunk_size):
+        if has_temporal:
+            rows = [
+                tuple(v.isoformat() if isinstance(v, (date, datetime)) else v for v in row)
+                for row in chunk.rows()
+            ]
+            con.executemany(sql, rows)
+        else:
+            con.executemany(sql, chunk.rows())
+
+
+def _create_sqlite_table_from_schema(
+    con: sqlite3.Connection, tbl_name: str, schema: dict[str, pl.DataType]
+) -> None:
+    cols_def = ", ".join(
+        f'"{col}" {_polars_to_sqlite_type(dt)}' for col, dt in schema.items()
+    )
+    if tbl_name == "corporates":
+        cols_def = cols_def.replace(
+            '"corporate_number" TEXT', '"corporate_number" TEXT PRIMARY KEY'
+        )
+    con.execute(f'CREATE TABLE "{tbl_name}" ({cols_def})')
+
+
+def _create_sqlite_indexes(con: sqlite3.Connection, table_names: set[str]) -> None:
+    if "permits" in table_names:
+        con.execute('CREATE INDEX IF NOT EXISTS idx_permits_corp ON "permits" ("corporate_number")')
+    if "spatial_profiles" in table_names:
+        con.execute(
+            'CREATE INDEX IF NOT EXISTS idx_spatial_corp ON "spatial_profiles" ("corporate_number")'
+        )
+    if "edinet_links" in table_names:
+        con.execute('CREATE INDEX IF NOT EXISTS idx_edinet_corp ON "edinet_links" ("corporate_number")')
+
+
 def _write_sqlite_tables(sqlite_path: Path, tables: dict[str, pl.DataFrame]) -> None:
     if sqlite_path.exists():
         sqlite_path.unlink()
     con = sqlite3.connect(str(sqlite_path))
     try:
         for tbl_name, df in tables.items():
-            cols_def = ", ".join(
-                f'"{col}" {_polars_to_sqlite_type(dt)}'
-                for col, dt in df.schema.items()
-            )
-            pk_clause = ""
-            if tbl_name == "corporates":
-                cols_def = cols_def.replace(
-                    '"corporate_number" TEXT', '"corporate_number" TEXT PRIMARY KEY'
-                )
-            con.execute(f'CREATE TABLE "{tbl_name}" ({cols_def}{pk_clause})')
-            if not df.is_empty():
-                placeholders = ", ".join("?" for _ in df.columns)
-                rows = []
-                for row in df.rows():
-                    cleaned = [
-                        v.isoformat() if isinstance(v, (date, datetime)) else v
-                        for v in row
-                    ]
-                    rows.append(tuple(cleaned))
-                con.executemany(
-                    f'INSERT INTO "{tbl_name}" VALUES ({placeholders})', rows
-                )
-        if "permits" in tables:
-            con.execute(
-                'CREATE INDEX IF NOT EXISTS idx_permits_corp ON "permits" ("corporate_number")'
-            )
-        if "spatial_profiles" in tables:
-            con.execute(
-                'CREATE INDEX IF NOT EXISTS idx_spatial_corp ON "spatial_profiles" ("corporate_number")'
-            )
-        if "edinet_links" in tables:
-            con.execute(
-                'CREATE INDEX IF NOT EXISTS idx_edinet_corp ON "edinet_links" ("corporate_number")'
-            )
+            _create_sqlite_table_from_schema(con, tbl_name, dict(df.schema))
+            _insert_df_chunks_sqlite(con, tbl_name, df)
+        _create_sqlite_indexes(con, set(tables.keys()))
         con.commit()
     finally:
         con.close()
+
+
+def export_from_parquet_dir(
+    output_dir: Path,
+    parquet_dir: Path,
+    name: str = "jp_opendata",
+) -> tuple[dict[str, Path], QualityReport]:
+    """Validate and export DuckDB + SQLite from pre-built Parquet files with bounded RAM."""
+    report = validate_parquet_dir(parquet_dir)
+    table_names = [
+        "corporates",
+        "permits",
+        "spatial_profiles",
+        "edinet_links",
+        "_metadata_sources",
+    ]
+    paths: dict[str, Path] = {}
+    for tbl_name in table_names:
+        paths[f"parquet_{tbl_name}"] = parquet_dir / f"{tbl_name}.parquet"
+
+    duckdb_path = output_dir / f"{name}.duckdb"
+    if duckdb_path.exists():
+        duckdb_path.unlink()
+    dcon = duckdb.connect(str(duckdb_path))
+    try:
+        for tbl_name in table_names:
+            pq_path = paths[f"parquet_{tbl_name}"]
+            dcon.execute(
+                f'CREATE OR REPLACE TABLE "{tbl_name}" AS SELECT * FROM read_parquet(?)',
+                [str(pq_path)],
+            )
+    finally:
+        dcon.close()
+    paths["duckdb"] = duckdb_path
+
+    sqlite_path = output_dir / f"{name}.sqlite"
+    if sqlite_path.exists():
+        sqlite_path.unlink()
+    con = sqlite3.connect(str(sqlite_path))
+    try:
+        for tbl_name in table_names:
+            pq_path = paths[f"parquet_{tbl_name}"]
+            lf = pl.scan_parquet(pq_path)
+            schema = {k: v for k, v in lf.collect_schema().items()}
+            _create_sqlite_table_from_schema(con, tbl_name, schema)
+            total_rows = int(lf.select(pl.len()).collect().item())
+            batch_size = 100_000
+            for offset in range(0, total_rows, batch_size):
+                chunk_df = lf.slice(offset, batch_size).collect()
+                _insert_df_chunks_sqlite(con, tbl_name, chunk_df, chunk_size=50_000)
+        _create_sqlite_indexes(con, set(table_names))
+        con.commit()
+    finally:
+        con.close()
+    paths["sqlite"] = sqlite_path
+
+    report_path = output_dir / f"{name}_quality_report.md"
+    report_path.write_text(report.to_markdown() + "\n", encoding="utf-8")
+    paths["report"] = report_path
+    return paths, report
 
 
 def export_integrated_db(
