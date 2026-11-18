@@ -1,5 +1,10 @@
 # jp-opendata-db
 
+> **English Summary:** Integrated Japanese public open data pipeline and prebuilt SQLite/DuckDB/Parquet dataset joining 5.83M National Tax Agency corporate numbers with MLIT geocoded land prices (3.55M matched) and MHLW/FSA permits (97,581 records, 98.5% matched), strictly from commercially redistributable public licenses.
+> - **English Datasets Hub:** https://terselogic.com/datasets/?utm_source=github&utm_medium=readme
+> - **Full Archive & Licensing (JA):** https://terselogic.com/datasets/jp-opendata/?utm_source=github&utm_medium=readme
+> - **Free Tokyo Sample on Hugging Face:** https://huggingface.co/datasets/terselogic/jp-opendata-sample
+
 国税庁の法人番号（13桁チェックデジット検証済み）を主キーに、国土交通省「位置参照情報」、国土数値情報「地価公示（L01）」、厚生労働省「介護サービス事業所」、金融庁「免許・許可・登録等を受けている業者一覧」、および `edinet-pit-dataset` を正規化・名寄せ・空間結合した静的データベース（SQLite / DuckDB / Parquet）構築パイプライン。
 
 ## 収録データとライセンス（すべて商用二次配布可を確認済み）
