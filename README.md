@@ -45,7 +45,7 @@ LIMIT 10;
 
 本リポジトリの `sample/`（東京都 2,000社）でスキーマ・SQL結合をご確認のうえ、全国47都道府県を統合したビルド済みパッケージ（SQLite / DuckDB / Parquet / 出典表記一式）は以下の製品ページより入手できます。
 
-- 製品ページ・購入案内: https://terselogic.com/datasets/jp-opendata/
+- 製品ページ・購入案内: https://terselogic.com/datasets/jp-opendata/?utm_source=github&utm_medium=readme
 - `corporates`: **5,830,372 社**（全国47都道府県）
 - `spatial_profiles`: **3,555,962 社**（全国 L01-25 地価公示 25,563 地点と結合）
 - `permits`: **97,581 件**（法人番号一致: **96,115 件 / 98.5%**）
