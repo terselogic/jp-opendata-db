@@ -40,3 +40,14 @@ JOIN permits p ON c.corporate_number = p.corporate_number
 JOIN spatial_profiles s ON c.corporate_number = s.corporate_number
 LIMIT 10;
 ```
+
+## フル統合版（全国47都道府県・有償商用パッケージ）
+
+本リポジトリの `sample/`（東京都 2,000社）でスキーマ・SQL結合をご確認のうえ、全国47都道府県を統合したビルド済みパッケージ（SQLite / DuckDB / Parquet / 出典表記一式）は以下の製品ページより入手できます。
+
+- 製品ページ・購入案内: https://terselogic.com/datasets/jp-opendata/
+- `corporates`: **5,830,372 社**（全国47都道府県）
+- `spatial_profiles`: **3,555,962 社**（全国 L01-25 地価公示 25,563 地点と結合）
+- `permits`: **97,581 件**（法人番号一致: **96,115 件 / 98.5%**）
+- `edinet_links`: **95 社** / `_metadata_sources`: **5 機関**
+- 配布アーカイブ: `jp_opendata_all_full_v1.zip`（1,531.8 MB）
