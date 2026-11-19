@@ -33,13 +33,15 @@ from jp_opendata.validator import SOURCES_METADATA_SCHEMA
 
 NTA_ZENKEN_URL = "https://www.houjin-bangou.nta.go.jp/pc/download/zenken/index.html"
 NTA_POST_URL = "https://www.houjin-bangou.nta.go.jp/download/zenken/index.html"
-MLIT_L01_TOKYO_URL = "https://nlftp.mlit.go.jp/ksj/gml/data/L01/L01-25/L01-25_13_GML.zip"
+MLIT_L01_TOKYO_URL = "https://nlftp.mlit.go.jp/ksj/gml/data/L01/L01-26/L01-26_13_GML.zip"
 MLIT_ISJ_GAIKU_TOKYO_URL = "https://nlftp.mlit.go.jp/isj/dls/data/24.0a/13000-24.0a.zip"
-MLIT_ISJ_OAZA_TOKYO_URL = "https://nlftp.mlit.go.jp/isj/dls/data/18.0b/13000-18.0b.zip"
+MLIT_ISJ_OAZA_TOKYO_URL = "https://nlftp.mlit.go.jp/isj/dls/data/19.0b/13000-19.0b.zip"
 MHLW_KAIGO_110_URL = "https://www.mhlw.go.jp/content/12300000/jigyosho_110_all_20260709180319.csv"
 FSA_KINSHOU_URL = "https://www.fsa.go.jp/menkyo/menkyoj/kinyushohin.xlsx"
 FSA_KASI_URL = "https://www.fsa.go.jp/menkyo/menkyoj/kasi.xlsx"
 FSA_SHIKIN_IDOU_URL = "https://www.fsa.go.jp/menkyo/menkyoj/shikin_idou.xlsx"
+FSA_GINKOU_URL = "https://www.fsa.go.jp/menkyo/menkyoj/ginkou.xlsx"
+FSA_SHINKIN_URL = "https://www.fsa.go.jp/menkyo/menkyoj/shinkin.xlsx"
 
 
 def download_nta_tokyo_zips(raw_dir: Path) -> list[Path]:
@@ -174,25 +176,27 @@ def main() -> None:
     sample_dir = root / "sample"
 
     nta_zips = download_nta_tokyo_zips(raw_dir)
-    l01_zip = download_file(MLIT_L01_TOKYO_URL, raw_dir / "L01-25_13_GML.zip")
+    l01_zip = download_file(MLIT_L01_TOKYO_URL, raw_dir / "L01-26_13_GML.zip")
     isj_gaiku_zip = download_file(MLIT_ISJ_GAIKU_TOKYO_URL, raw_dir / "13000-24.0a.zip")
-    isj_oaza_zip = download_file(MLIT_ISJ_OAZA_TOKYO_URL, raw_dir / "13000-18.0b.zip")
+    isj_oaza_zip = download_file(MLIT_ISJ_OAZA_TOKYO_URL, raw_dir / "13000-19.0b.zip")
     kaigo_csv = download_file(MHLW_KAIGO_110_URL, raw_dir / "mhlw_kaigo_110.csv")
     kinshou_xlsx = download_file(FSA_KINSHOU_URL, raw_dir / "fsa_kinyushohin.xlsx")
     kasi_xlsx = download_file(FSA_KASI_URL, raw_dir / "fsa_kasi.xlsx")
     shikin_xlsx = download_file(FSA_SHIKIN_IDOU_URL, raw_dir / "fsa_shikin_idou.xlsx")
+    ginkou_xlsx = download_file(FSA_GINKOU_URL, raw_dir / "fsa_ginkou.xlsx")
+    shinkin_xlsx = download_file(FSA_SHINKIN_URL, raw_dir / "fsa_shinkin.xlsx")
 
     print("Loading NTA Tokyo corporates (all split archives)...")
     corps_df = pl.concat([load_nta_corporates(z, limit=None) for z in nta_zips]).unique(
         subset=["corporate_number"], keep="first"
     )
 
-    print("Geocoding corporates with MLIT ISJ (gaiku 24.0a + oaza 18.0b)...")
+    print("Geocoding corporates with MLIT ISJ (gaiku 24.0a + oaza 19.0b)...")
     corps_geo = geocode_corporates_with_isj(corps_df, isj_gaiku_zip, isj_oaza_zip)
     geocoded_count = corps_geo.filter(pl.col("latitude").is_not_null()).height
     print(f"Geocoded corporates: {geocoded_count:,} / {corps_geo.height:,} ({geocoded_count / corps_geo.height:.1%})")
 
-    print("Parsing MLIT L01 Tokyo land prices...")
+    print("Parsing MLIT L01-26 Tokyo land prices...")
     l01_df = parse_mlit_l01_gml(l01_zip)
 
     print("Loading & resolving MHLW Care Service + FSA Financial Permits...")
@@ -201,6 +205,8 @@ def main() -> None:
         + load_fsa_excel_permits(kinshou_xlsx, "金融商品取引業者", prefecture_filter="東京都")
         + load_fsa_excel_permits(kasi_xlsx, "貸金業者（財務局長登録）", prefecture_filter="東京都")
         + load_fsa_excel_permits(shikin_xlsx, "資金移動業者", prefecture_filter="東京都")
+        + load_fsa_excel_permits(ginkou_xlsx, "銀行", prefecture_filter="東京都")
+        + load_fsa_excel_permits(shinkin_xlsx, "信用金庫", prefecture_filter="東京都")
     )
     permits_df = resolve_permits_to_corporates(permit_records, corps_geo)
 
@@ -232,43 +238,43 @@ def main() -> None:
         [
             {
                 "source_id": "nta_corp",
-                "source_name": "国税庁法人番号公表サイト（東京都）",
+                "source_name": "国税庁法人番号公表サイト（東京都）を加工して作成",
                 "publisher": "国税庁",
-                "license_name": "公共データ利用規約（第1.0版）",
+                "license_name": "公共データ利用規約（第1.0版 / PDL1.0）",
                 "source_url": NTA_ZENKEN_URL,
-                "retrieved_date": "2026-11-17",
+                "retrieved_date": "2026-11-19",
             },
             {
                 "source_id": "mlit_isj",
-                "source_name": "国土交通省 位置参照情報（街区24.0a・大字町丁目18.0b 東京都）",
+                "source_name": "国土交通省 位置参照情報（街区24.0a・大字町丁目19.0b 東京都）を加工して作成",
                 "publisher": "国土交通省",
-                "license_name": "位置参照情報利用約款（商用・有償二次配布可）",
+                "license_name": "位置参照情報利用約款（出典・加工表示の上で商用・有償二次配布可）",
                 "source_url": "https://nlftp.mlit.go.jp/isj/",
-                "retrieved_date": "2026-11-17",
+                "retrieved_date": "2026-11-19",
             },
             {
                 "source_id": "mlit_l01",
-                "source_name": "国土数値情報 地価公示データ（東京都 L01-25）",
+                "source_name": "国土数値情報 地価公示データ（東京都 L01-26 / 令和8年版）を加工して作成",
                 "publisher": "国土交通省",
                 "license_name": "国土数値情報利用約款（L01商用可）",
                 "source_url": MLIT_L01_TOKYO_URL,
-                "retrieved_date": "2026-11-17",
+                "retrieved_date": "2026-11-19",
             },
             {
                 "source_id": "mhlw_kaigo",
-                "source_name": "介護サービス情報公表システム オープンデータ（訪問介護）",
+                "source_name": "介護サービス情報公表システム オープンデータ（訪問介護）を加工して作成",
                 "publisher": "厚生労働省",
                 "license_name": "CC BY 4.0 / 厚生労働省利用規約",
                 "source_url": "https://www.mhlw.go.jp/stf/kaigo-kouhyou_opendata.html",
-                "retrieved_date": "2026-11-17",
+                "retrieved_date": "2026-11-19",
             },
             {
                 "source_id": "fsa_menkyo",
-                "source_name": "免許・許可・登録等を受けている業者一覧（金商・貸金・資金移動）",
+                "source_name": "免許・許可・登録等を受けている業者一覧（金商・貸金・資金移動・銀行・信用金庫）を加工して作成",
                 "publisher": "金融庁",
-                "license_name": "政府標準利用規約（第2.0版）準拠",
+                "license_name": "公共データ利用規約（第1.0版 / PDL1.0）",
                 "source_url": "https://www.fsa.go.jp/menkyo/menkyo.html",
-                "retrieved_date": "2026-11-17",
+                "retrieved_date": "2026-11-19",
             },
         ],
         schema=SOURCES_METADATA_SCHEMA,

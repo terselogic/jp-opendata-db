@@ -1,0 +1,20 @@
+jp-opendata-db All-Japan Full Package (v2)
+加工主体: TerseLogic (https://terselogic.com/)
+本データベースは下記の公的オープンデータを正規化・名寄せ・空間結合して TerseLogic が独自に編集・加工したものです（各府省が作成した未加工データではありません）。
+
+一次出典および適用ライセンス:
+- 「国税庁法人番号公表サイト 全件データ」（国税庁）(https://www.houjin-bangou.nta.go.jp/pc/download/zenken/index.html) を加工して作成 — 公共データ利用規約（第1.0版 / PDL1.0）
+- 「位置参照情報（街区レベル 24.0a / 大字・町丁目レベル 19.0b）」（国土交通省）(https://nlftp.mlit.go.jp/isj/) を加工して作成 — 位置参照情報利用約款（出典・加工表示の上で商用・有償二次配布可）
+- 「国土数値情報 地価公示データ（L01-26 / 令和8年版）」（国土交通省）(https://nlftp.mlit.go.jp/ksj/gml/data/L01/L01-26/L01-26_GML.zip) を加工して作成 — 国土数値情報利用約款（L01商用可）
+- 「介護サービス情報公表システム オープンデータ（最新全35サービス種別）」（厚生労働省）(https://www.mhlw.go.jp/stf/kaigo-kouhyou_opendata.html) を加工して作成 — CC BY 4.0
+- 「免許・許可・登録等を受けている業者一覧（全8業種）」（金融庁）(https://www.fsa.go.jp/menkyo/menkyo.html) を加工して作成 — 公共データ利用規約（第1.0版 / PDL1.0 / https://www.fsa.go.jp/rules/index.html）
+- 「EDINET 提出者コード一覧・有価証券報告書データ」（金融庁）(https://disclosure2.edinet-fsa.go.jp/) を加工して作成 — 公共データ利用規約（第1.0版 / PDL1.0） / EDINET タクソノミ © Copyright 2014 Financial Services Agency, The Japanese Government.
+
+## Dataset Quality Report
+
+- Corporates (`corporates`): 2,000
+- Permits (`permits`): 4,448
+- Permits matched to Corporate Number: 4,448 (100.0%)
+- Spatial enriched records (`spatial_profiles`): 2,000
+- EDINET linked corporations (`edinet_links`): 2,000
+- Attribution sources (`_metadata_sources`): 6
