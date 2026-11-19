@@ -1,18 +1,23 @@
-"""Bridge connecting edinet-pit-dataset company disclosures to NTA Corporate Numbers."""
+"""Bridge connecting EDINET submitters & edinet-pit-dataset metrics to NTA Corporate Numbers."""
 
 from __future__ import annotations
 
+import csv
+import io
 from pathlib import Path
+import zipfile
 
 import polars as pl
 
-from jp_opendata.normalizer import normalize_company_name
+from jp_opendata.normalizer import is_valid_corporate_number, normalize_company_name
 
 EDINET_BRIDGE_SCHEMA: dict[str, pl.DataType] = {
     "corporate_number": pl.String,
     "edinet_code": pl.String,
     "sec_code": pl.String,
     "filer_name": pl.String,
+    "listing_status": pl.String,
+    "industry": pl.String,
     "latest_period_end": pl.Date,
     "net_sales": pl.Float64,
     "operating_income": pl.Float64,
@@ -21,19 +26,35 @@ EDINET_BRIDGE_SCHEMA: dict[str, pl.DataType] = {
 }
 
 
-def build_edinet_bridge(
-    edinet_parquet_path: Path,
-    corporates_df: pl.DataFrame,
-) -> pl.DataFrame:
-    """Link latest EDINET corporate metrics to NTA corporate_number via normalized name."""
-    if not edinet_parquet_path.exists() or corporates_df.is_empty():
-        return pl.DataFrame(schema=EDINET_BRIDGE_SCHEMA)
-
+def _load_edinet_metrics_summary(edinet_parquet_path: Path | None) -> pl.DataFrame:
+    if edinet_parquet_path is None or not edinet_parquet_path.exists():
+        return pl.DataFrame(
+            schema={
+                "edinet_code": pl.String,
+                "sec_code": pl.String,
+                "filer_name": pl.String,
+                "latest_period_end": pl.Date,
+                "net_sales": pl.Float64,
+                "operating_income": pl.Float64,
+                "net_assets": pl.Float64,
+                "risk_change_score": pl.Float64,
+            }
+        )
     ed_df = pl.read_parquet(edinet_parquet_path)
     if ed_df.is_empty():
-        return pl.DataFrame(schema=EDINET_BRIDGE_SCHEMA)
+        return pl.DataFrame(
+            schema={
+                "edinet_code": pl.String,
+                "sec_code": pl.String,
+                "filer_name": pl.String,
+                "latest_period_end": pl.Date,
+                "net_sales": pl.Float64,
+                "operating_income": pl.Float64,
+                "net_assets": pl.Float64,
+                "risk_change_score": pl.Float64,
+            }
+        )
 
-    # 企業ごとに最新提出日時のレコードへ集約し、主要財務3指標をピボット
     latest_doc = (
         ed_df.sort("submit_datetime")
         .group_by("edinet_code", maintain_order=True)
@@ -56,7 +77,93 @@ def build_edinet_bridge(
         if col not in pivoted.columns:
             pivoted = pivoted.with_columns(pl.lit(None, dtype=pl.Float64).alias(col))
 
-    summary = latest_doc.join(pivoted, on="edinet_code", how="left")
+    return latest_doc.join(pivoted, on="edinet_code", how="left")
+
+
+def build_edinet_bridge_from_codelist(
+    codelist_zip_path: Path,
+    valid_corporate_numbers: set[str],
+    edinet_parquet_path: Path | None = None,
+) -> pl.DataFrame:
+    """Build full EDINET-to-NTA bridge from FSA official EdinetcodeDlInfo.csv + optional PIT metrics."""
+    if not codelist_zip_path.exists() or not valid_corporate_numbers:
+        return pl.DataFrame(schema=EDINET_BRIDGE_SCHEMA)
+
+    with zipfile.ZipFile(codelist_zip_path) as zf:
+        csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+        if not csv_names:
+            return pl.DataFrame(schema=EDINET_BRIDGE_SCHEMA)
+        raw_text = zf.read(csv_names[0]).decode("cp932", errors="replace")
+
+    reader = csv.reader(io.StringIO(raw_text))
+    header: list[str] | None = None
+    for row in reader:
+        if row and any("ＥＤＩＮＥＴコード" in c or "EDINETコード" in c for c in row):
+            header = [c.strip() for c in row]
+            break
+    if not header:
+        return pl.DataFrame(schema=EDINET_BRIDGE_SCHEMA)
+
+    col_idx = {name: i for i, name in enumerate(header)}
+    ed_i = col_idx.get("ＥＤＩＮＥＴコード", col_idx.get("EDINETコード", 0))
+    list_i = col_idx.get("上場区分", 2)
+    name_i = col_idx.get("提出者名", 6)
+    ind_i = col_idx.get("提出者業種", 10)
+    sec_i = col_idx.get("証券コード", 11)
+    corp_i = col_idx.get("提出者法人番号", 12)
+
+    metrics_df = _load_edinet_metrics_summary(edinet_parquet_path)
+    metrics_by_edinet: dict[str, dict[str, object]] = {
+        str(r["edinet_code"]): r for r in metrics_df.to_dicts()
+    }
+
+    rows: list[dict[str, object]] = []
+    seen_cnums: set[str] = set()
+    for rec in reader:
+        if len(rec) <= corp_i:
+            continue
+        ed_code = rec[ed_i].strip()
+        cnum = rec[corp_i].strip()
+        if not ed_code or not is_valid_corporate_number(cnum):
+            continue
+        if cnum not in valid_corporate_numbers or cnum in seen_cnums:
+            continue
+        seen_cnums.add(cnum)
+
+        m = metrics_by_edinet.get(ed_code, {})
+        sec_code = rec[sec_i].strip() if sec_i < len(rec) else ""
+        rows.append(
+            {
+                "corporate_number": cnum,
+                "edinet_code": ed_code,
+                "sec_code": sec_code or str(m.get("sec_code") or "") or None,
+                "filer_name": rec[name_i].strip(),
+                "listing_status": rec[list_i].strip() if list_i < len(rec) else "",
+                "industry": rec[ind_i].strip() if ind_i < len(rec) else "",
+                "latest_period_end": m.get("latest_period_end"),
+                "net_sales": m.get("net_sales"),
+                "operating_income": m.get("operating_income"),
+                "net_assets": m.get("net_assets"),
+                "risk_change_score": m.get("risk_change_score"),
+            }
+        )
+
+    if not rows:
+        return pl.DataFrame(schema=EDINET_BRIDGE_SCHEMA)
+    return pl.DataFrame(rows, schema=EDINET_BRIDGE_SCHEMA).sort("corporate_number")
+
+
+def build_edinet_bridge(
+    edinet_parquet_path: Path,
+    corporates_df: pl.DataFrame,
+) -> pl.DataFrame:
+    """Link latest EDINET corporate metrics to NTA corporate_number via normalized name."""
+    if not edinet_parquet_path.exists() or corporates_df.is_empty():
+        return pl.DataFrame(schema=EDINET_BRIDGE_SCHEMA)
+
+    summary = _load_edinet_metrics_summary(edinet_parquet_path)
+    if summary.is_empty():
+        return pl.DataFrame(schema=EDINET_BRIDGE_SCHEMA)
 
     corp_by_norm: dict[str, list[str]] = {}
     corp_by_core: dict[str, list[str]] = {}
@@ -83,6 +190,8 @@ def build_edinet_bridge(
                 "edinet_code": rec["edinet_code"],
                 "sec_code": rec["sec_code"],
                 "filer_name": filer,
+                "listing_status": "上場" if rec.get("sec_code") else "",
+                "industry": "",
                 "latest_period_end": rec["latest_period_end"],
                 "net_sales": rec.get("net_sales"),
                 "operating_income": rec.get("operating_income"),

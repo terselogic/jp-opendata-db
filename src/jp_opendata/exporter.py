@@ -13,7 +13,7 @@ from jp_opendata.validator import QualityReport, validate_dataset, validate_parq
 
 
 def _polars_to_sqlite_type(dtype: pl.DataType) -> str:
-    if dtype in (pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64):
+    if dtype in (pl.Boolean, pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64):
         return "INTEGER"
     if dtype in (pl.Float32, pl.Float64):
         return "REAL"
@@ -53,6 +53,10 @@ def _create_sqlite_table_from_schema(
 
 
 def _create_sqlite_indexes(con: sqlite3.Connection, table_names: set[str]) -> None:
+    if "corporates" in table_names:
+        cols = {row[1] for row in con.execute('PRAGMA table_info("corporates")').fetchall()}
+        if "is_closed" in cols:
+            con.execute('CREATE INDEX IF NOT EXISTS idx_corporates_closed ON "corporates" ("is_closed")')
     if "permits" in table_names:
         con.execute('CREATE INDEX IF NOT EXISTS idx_permits_corp ON "permits" ("corporate_number")')
     if "spatial_profiles" in table_names:

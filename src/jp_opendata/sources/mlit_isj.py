@@ -10,7 +10,7 @@ import zipfile
 
 import polars as pl
 
-from jp_opendata.normalizer import normalize_address
+from jp_opendata.normalizer import normalize_address, strip_address_oaza_variants
 
 # 街区キーから末尾の号・枝番（例: "-1-2" の最後の番号）を落として街区レベルに合わせる用
 GAIIKU_PREFIX_RE = re.compile(r"^([^\d-]+(?:\d+(?:-\d+)?)?)")
@@ -46,11 +46,15 @@ def _extract_gaiku_lookup(zip_path: Path) -> dict[str, tuple[float, float]]:
         norm = normalize_address(full).normalized
         if norm and norm not in lookup:
             lookup[norm] = (lat, lon)
+        if koaza:
+            no_koaza = normalize_address(f"{pref}{muni}{oaza}{gaiku}").normalized
+            if no_koaza and no_koaza not in lookup:
+                lookup[no_koaza] = (lat, lon)
     return lookup
 
 
 def _extract_oaza_lookup(zip_path: Path) -> dict[str, tuple[float, float]]:
-    """Build oaza/chome lookup: normalized(pref+muni+oaza) -> (lat, lon)."""
+    """Build oaza/chome lookup including normalized variants without 大字/字 markers."""
     lookup: dict[str, tuple[float, float]] = {}
     with zipfile.ZipFile(zip_path) as zf:
         csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
@@ -62,7 +66,8 @@ def _extract_oaza_lookup(zip_path: Path) -> dict[str, tuple[float, float]]:
     for row in reader:
         pref = (row.get("都道府県名") or "").strip()
         muni = (row.get("市区町村名") or "").strip()
-        oaza = (row.get("大字・丁目名") or "").strip()
+        oaza = (row.get("大字町丁目名") or row.get("大字・丁目名") or "").strip()
+        koaza = (row.get("小字名") or row.get("小字・通称名") or "").strip()
         lat_s = (row.get("緯度") or "").strip()
         lon_s = (row.get("経度") or "").strip()
         if not (pref and muni and oaza and lat_s and lon_s):
@@ -71,9 +76,16 @@ def _extract_oaza_lookup(zip_path: Path) -> dict[str, tuple[float, float]]:
             lat, lon = float(lat_s), float(lon_s)
         except ValueError:
             continue
-        norm = normalize_address(f"{pref}{muni}{oaza}").normalized
-        if norm and norm not in lookup:
-            lookup[norm] = (lat, lon)
+
+        for raw_key in (f"{pref}{muni}{oaza}{koaza}", f"{pref}{muni}{oaza}"):
+            if not raw_key:
+                continue
+            norm = normalize_address(raw_key).normalized
+            if norm and norm not in lookup:
+                lookup[norm] = (lat, lon)
+            for variant in strip_address_oaza_variants(norm):
+                if variant and variant not in lookup:
+                    lookup[variant] = (lat, lon)
     return lookup
 
 
@@ -82,7 +94,7 @@ def geocode_corporates_with_isj(
     gaiku_zip_path: Path,
     oaza_zip_path: Path | None = None,
 ) -> pl.DataFrame:
-    """Attach (latitude, longitude) to corporates using MLIT ISJ gaiku -> oaza fallback."""
+    """Attach (latitude, longitude) to corporates using MLIT ISJ gaiku -> oaza multi-stage fallback."""
     if corporates_df.is_empty():
         return corporates_df
 
@@ -100,15 +112,28 @@ def geocode_corporates_with_isj(
         skey = str(row["street_key"] or "")
         coord: tuple[float, float] | None = gaiku_map.get(skey)
         if coord is None and "-" in skey:
-            # 末尾の号を落として街区レベル（例: "...1-6-1" -> "...1-6"）で照合
+            # 部屋番号・号を末尾から段階的に落として街区レベルへ照合（例: "...6-25-7-207" -> "...6-25-7" -> "...6-25"）
             parts = skey.split("-")
-            if len(parts) >= 3:
-                coord = gaiku_map.get("-".join(parts[:-1]))
-            if coord is None and oaza_map:
-                # 町丁目レベル（例: "...1"）でフォールバック
-                coord = oaza_map.get(parts[0])
+            for end_idx in range(len(parts) - 1, 0, -1):
+                prefix = "-".join(parts[:end_idx])
+                coord = gaiku_map.get(prefix)
+                if coord is not None:
+                    break
         if coord is None and oaza_map:
             coord = oaza_map.get(skey)
+            if coord is None:
+                for cand in strip_address_oaza_variants(skey):
+                    coord = oaza_map.get(cand)
+                    if coord is not None:
+                        break
+            if coord is None:
+                # 大字＋小字・通称名の細粒表記に対し、末尾1〜6文字を削った最長大字プレフィックス照合
+                base = strip_address_oaza_variants(skey)[-1] if strip_address_oaza_variants(skey) else ""
+                for trim in range(1, min(7, max(1, len(base) - 5))):
+                    cand = base[:-trim]
+                    if cand in oaza_map:
+                        coord = oaza_map[cand]
+                        break
 
         if coord is not None:
             lats.append(coord[0])

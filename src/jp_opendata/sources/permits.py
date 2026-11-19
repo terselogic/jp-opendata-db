@@ -83,10 +83,17 @@ def resolve_permits_to_corporates(
         | pl.col("core_name").is_in(list(core_names))
     )
 
-    corp_rows = filtered_corps.select(
-        ["corporate_number", "norm_name", "core_name", "prefecture", "municipality", "street_key"]
-    ).to_dicts()
+    select_cols = ["corporate_number", "norm_name", "core_name", "prefecture", "municipality", "street_key"]
+    has_coords = "latitude" in filtered_corps.columns and "longitude" in filtered_corps.columns
+    if has_coords:
+        select_cols.extend(["latitude", "longitude"])
+    corp_rows = filtered_corps.select(select_cols).to_dicts()
     known_corp_nums = {str(r["corporate_number"]) for r in corp_rows}
+    corp_coords: dict[str, tuple[float | None, float | None]] = {
+        str(r["corporate_number"]): (r.get("latitude"), r.get("longitude"))
+        for r in corp_rows
+        if has_coords and r.get("latitude") is not None and r.get("longitude") is not None
+    }
 
     # Tier 2: (norm_name, municipality, street_key) -> [corporate_number]
     tier2_index: dict[tuple[str, str, str], list[str]] = {}
@@ -146,6 +153,11 @@ def resolve_permits_to_corporates(
                     elif len(cands2) > 1 or len(cands3) > 1 or len(cands4) > 1:
                         tier = "ambiguous"
 
+        lat = p.latitude
+        lon = p.longitude
+        if (lat is None or lon is None) and matched_cnum and matched_cnum in corp_coords:
+            lat, lon = corp_coords[matched_cnum]
+
         resolved_rows.append(
             {
                 "permit_id": p.permit_id,
@@ -156,8 +168,8 @@ def resolve_permits_to_corporates(
                 "corporate_number": matched_cnum,
                 "match_tier": tier,
                 "match_confidence": confidence,
-                "latitude": p.latitude,
-                "longitude": p.longitude,
+                "latitude": lat,
+                "longitude": lon,
             }
         )
 
@@ -201,9 +213,12 @@ def load_mhlw_kaigo_permits(
         if not pid:
             continue
 
+        code_match = re.search(r"jigyosho_(\d+)_", csv_path.name)
+        service_key = code_match.group(1) if code_match else service
+
         records.append(
             PermitRecord(
-                permit_id=f"KAIGO-{pid}",
+                permit_id=f"KAIGO-{service_key}-{pid}",
                 permit_category=service,
                 authority_name="厚生労働省・都道府県",
                 raw_company_name=corp_name,
@@ -216,78 +231,121 @@ def load_mhlw_kaigo_permits(
     return records
 
 
+FSA_CATEGORY_SLUGS: dict[str, str] = {
+    "金融商品取引業者": "kinyushohin",
+    "貸金業者（財務局長登録）": "kasi",
+    "資金移動業者": "shikin_idou",
+    "暗号資産交換業者": "kasoutuka",
+    "銀行": "ginkou",
+    "信用金庫": "shinkin",
+    "前払式支払手段（第三者型）": "daisan",
+    "監査法人": "kansahoujin",
+}
+
+
 def load_fsa_excel_permits(
     xlsx_path: Path,
     permit_category: str,
     prefecture_filter: str | None = "東京都",
 ) -> list[PermitRecord]:
-    """Load FSA licensed-operator Excel list (.xlsx) into PermitRecord list."""
+    """Load FSA licensed-operator Excel list (.xlsx) across ALL sheets into PermitRecord list."""
     wb = openpyxl.load_workbook(io.BytesIO(xlsx_path.read_bytes()), read_only=True, data_only=True)
-    ws = wb.active
-    rows_iter = ws.iter_rows(values_only=True)
-
-    col_idx: dict[str, int] = {}
-    for row in rows_iter:
-        cells = [str(c).replace("\n", "").strip() if c is not None else "" for c in row]
-        has_reg = any(k in cells for k in ("登録番号", "免許番号", "許可番号"))
-        has_loc = any(k in cells for k in ("法人番号", "本店等所在地", "本店所在地", "所在地"))
-        if has_reg and has_loc:
-            for idx, label in enumerate(cells):
-                if label:
-                    col_idx[label] = idx
-            break
-
-    if not col_idx:
-        return []
-
-    reg_i = next(
-        (col_idx[k] for k in ("登録番号", "免許番号", "許可番号") if k in col_idx),
-        None,
-    )
-    corp_i = col_idx.get("法人番号")
-    addr_i = next(
-        (col_idx[k] for k in ("本店等所在地", "本店所在地", "所在地") if k in col_idx),
-        None,
-    )
-    name_i = next(
-        (
-            idx
-            for label, idx in col_idx.items()
-            if label.endswith("名") or "商号" in label or "名称" in label
-        ),
-        None,
-    )
-    if reg_i is None or name_i is None:
-        return []
-
+    cat_slug = FSA_CATEGORY_SLUGS.get(permit_category, re.sub(r"\s+", "_", permit_category))
     records: list[PermitRecord] = []
-    for row in rows_iter:
-        if len(row) <= max(reg_i, name_i):
-            continue
-        reg_no = str(row[reg_i] or "").replace("\n", " ").strip()
-        raw_name = str(row[name_i] or "").strip()
-        if not reg_no or not raw_name:
-            continue
-        # 脚注記号（例: "※1"）を除去
-        cleaned_name = re.sub(r"※\d+$", "", raw_name).strip()
-        addr = str(row[addr_i] or "").strip() if addr_i is not None and addr_i < len(row) else ""
-        if prefecture_filter and addr and not addr.startswith(prefecture_filter):
-            continue
 
-        raw_cnum = row[corp_i] if corp_i is not None and corp_i < len(row) else None
-        cnum_str = str(raw_cnum).strip() if raw_cnum is not None else ""
-        if cnum_str.endswith(".0"):
-            cnum_str = cnum_str[:-2]
-        cnum = cnum_str if cnum_str.isdigit() and len(cnum_str) == 13 else None
+    for sheet_idx, sheet_name in enumerate(wb.sheetnames):
+        ws = wb[sheet_name]
+        rows_iter = ws.iter_rows(values_only=True)
 
-        records.append(
-            PermitRecord(
-                permit_id=f"FSA-{reg_no}",
-                permit_category=permit_category,
-                authority_name="金融庁",
-                raw_company_name=cleaned_name,
-                raw_address=addr,
-                corporate_number=cnum,
+        col_idx: dict[str, int] = {}
+        for row in rows_iter:
+            cells = [str(c).replace("\n", "").strip() if c is not None else "" for c in row]
+            has_reg = any(k in cells for k in ("登録番号", "免許番号", "許可番号"))
+            has_corp = "法人番号" in cells
+            has_loc = any(
+                k in cells
+                for k in ("本店等所在地", "本店所在地", "事務所の所在地", "所在地")
             )
+            has_name = any(
+                c.endswith("名") or "商号" in c or "名称" in c
+                for c in cells
+                if c and c != "都道府県名"
+            )
+            if (has_reg or has_corp) and (has_loc or has_name):
+                for idx, label in enumerate(cells):
+                    if label and label not in col_idx:
+                        col_idx[label] = idx
+                break
+
+        if not col_idx:
+            continue
+
+        reg_i = next(
+            (col_idx[k] for k in ("登録番号", "免許番号", "許可番号") if k in col_idx),
+            None,
         )
+        corp_i = col_idx.get("法人番号")
+        addr_i = next(
+            (
+                col_idx[k]
+                for k in ("本店等所在地", "本店所在地", "事務所の所在地", "所在地")
+                if k in col_idx
+            ),
+            None,
+        )
+        name_i = next(
+            (
+                idx
+                for label, idx in col_idx.items()
+                if label != "都道府県名"
+                and (label.endswith("名") or "商号" in label or "名称" in label)
+            ),
+            None,
+        )
+        if name_i is None:
+            continue
+
+        seq = 0
+        for row in rows_iter:
+            if len(row) <= name_i:
+                continue
+            raw_name = str(row[name_i] or "").strip()
+            if not raw_name or raw_name in ("銀行名", "名称", "商号又は名称"):
+                continue
+
+            reg_no = ""
+            if reg_i is not None and reg_i < len(row):
+                reg_no = str(row[reg_i] or "").replace("\n", " ").strip()
+
+            raw_cnum = row[corp_i] if corp_i is not None and corp_i < len(row) else None
+            cnum_str = str(raw_cnum).strip() if raw_cnum is not None else ""
+            if cnum_str.endswith(".0"):
+                cnum_str = cnum_str[:-2]
+            cnum = cnum_str if cnum_str.isdigit() and len(cnum_str) == 13 else None
+
+            # 登録番号列があるシートでは登録番号欠損行（注記・集計行等）をスキップ
+            if reg_i is not None and not reg_no:
+                continue
+            # 登録番号列がないシート（銀行・信用金庫等）では法人番号・住所いずれも空の注記行をスキップ
+            addr = str(row[addr_i] or "").strip() if addr_i is not None and addr_i < len(row) else ""
+            if reg_i is None and not cnum and not addr:
+                continue
+
+            # 脚注記号（例: "※1"）を除去
+            cleaned_name = re.sub(r"※\d+$", "", raw_name).strip()
+            if prefecture_filter and addr and not addr.startswith(prefecture_filter):
+                continue
+
+            seq += 1
+            id_part = reg_no or cnum or f"s{sheet_idx}-{seq}"
+            records.append(
+                PermitRecord(
+                    permit_id=f"FSA-{cat_slug}-{id_part}",
+                    permit_category=permit_category,
+                    authority_name="金融庁",
+                    raw_company_name=cleaned_name,
+                    raw_address=addr,
+                    corporate_number=cnum,
+                )
+            )
     return records

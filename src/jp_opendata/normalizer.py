@@ -89,8 +89,14 @@ KANJI_DIGIT_MAP: dict[str, int] = {
     "九": 9,
 }
 
-HYPHEN_RE = re.compile(r"[−―‐ー－−]+")
+HYPHEN_RE = re.compile(r"[−―‐－−]+")
+DIGIT_CHOON_RE = re.compile(r"(?<=\d)ー(?=\d)")
+TRAILING_CHOON_DIGIT_RE = re.compile(r"(?<=\d)ー(?=[0-9一二三四五六七八九十])")
 CHOME_RE = re.compile(r"([0-9一二三四五六七八九十〇零]+)\s*(?:丁目|番地|番|号|条|線)")
+NO_CONNECTOR_RE = re.compile(r"(\d+)-?の(\d+)")
+TRAILING_NUM_RE = re.compile(r"[\d-]+$")
+KANJI_BRANCH_RE = re.compile(r"[甲乙丙丁戊己庚辛壬癸]$")
+OAZA_MARKER_RE = re.compile(r"(?:大字|字)")
 
 
 @dataclass(frozen=True)
@@ -151,6 +157,8 @@ def normalize_address(raw_address: str) -> NormalizedAddress:
     text = unicodedata.normalize("NFKC", raw_address).translate(VARIANT_KANJI_MAP)
     text = re.sub(r"\s+", "", text)
     text = HYPHEN_RE.sub("-", text)
+    text = DIGIT_CHOON_RE.sub("-", text)
+    text = TRAILING_CHOON_DIGIT_RE.sub("-", text)
 
     prefecture = ""
     rest = text
@@ -165,6 +173,7 @@ def normalize_address(raw_address: str) -> NormalizedAddress:
         return f"{num}-"
 
     rest = CHOME_RE.sub(_replace_chome, rest)
+    rest = NO_CONNECTOR_RE.sub(r"\1-\2", rest)
     rest = re.sub(r"-+", "-", rest).strip("-")
 
     municipality = ""
@@ -182,3 +191,41 @@ def normalize_address(raw_address: str) -> NormalizedAddress:
         normalized=normalized,
         street_key=f"{prefecture}{street_key}",
     )
+
+
+def strip_address_oaza_variants(street_key: str) -> list[str]:
+    """Generate progressively coarser oaza/town keys from a normalized street_key."""
+    candidates: list[str] = []
+
+    def _add(val: str) -> None:
+        v = val.strip("-")
+        if v and v not in candidates:
+            candidates.append(v)
+
+    base = street_key.split("-", 1)[0]
+    _add(base)
+
+    # 末尾の数字・番地を剥離（例: "長崎県長崎市五島町5" -> "長崎県長崎市五島町"）
+    no_num = TRAILING_NUM_RE.sub("", base)
+    _add(no_num)
+
+    # 甲乙丙丁戊などの地方地番記号を剥離（例: "...多比良乙" -> "...多比良"）
+    no_branch = KANJI_BRANCH_RE.sub("", no_num)
+    _add(no_branch)
+
+    # 小字（「字〇〇」以降）を落として大字単位へフォールバック（例: "...井内字杉ケ崎" -> "...井内"）
+    if "字" in no_num:
+        idx = no_num.find("字")
+        if idx > 0:
+            _add(no_num[:idx])
+        _add(OAZA_MARKER_RE.sub("", no_num))
+    if "大字" in no_num:
+        _add(no_num.replace("大字", ""))
+        _add(OAZA_MARKER_RE.sub("", no_num))
+
+    # 小字＋甲乙除去の組合せ
+    if "字" in no_branch:
+        idx = no_branch.find("字")
+        if idx > 0:
+            _add(no_branch[:idx])
+    return candidates

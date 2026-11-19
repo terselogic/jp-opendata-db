@@ -24,7 +24,7 @@ def test_load_mhlw_kaigo_permits_filters_prefecture(tmp_path: Path) -> None:
     records = load_mhlw_kaigo_permits(csv_path, prefecture_filter="東京都")
     assert len(records) == 1
     rec = records[0]
-    assert rec.permit_id == "KAIGO-101"
+    assert rec.permit_id == "KAIGO-訪問介護-101"
     assert rec.permit_category == "訪問介護"
     assert rec.raw_company_name == "株式会社テスト介護"
     assert rec.raw_address == "東京都千代田区丸の内1-1-1"
@@ -52,8 +52,27 @@ def test_load_fsa_excel_permits_detects_varied_headers(tmp_path: Path) -> None:
     )
     assert len(records) == 1
     rec = records[0]
-    assert rec.permit_id == "FSA-第00001号"
+    assert rec.permit_id == "FSA-テスト金融業者-第00001号"
     assert rec.authority_name == "金融庁"
     assert rec.raw_company_name == "株式会社東京フィナンシャル"
     assert rec.corporate_number == "1000012010001"
     assert rec.raw_address == "東京都中央区日本橋1-1-1"
+
+
+def test_load_fsa_excel_permits_reads_multisheet_banks_without_reg_number(tmp_path: Path) -> None:
+    xlsx_path = tmp_path / "fsa_bank.xlsx"
+    wb = openpyxl.Workbook()
+    ws1 = wb.active
+    assert ws1 is not None
+    ws1.title = "都市銀行"
+    ws1.append(["業態", "所管", "都道府県", "銀行名", "法人番号", "郵便番号", "本店等所在地"])
+    ws1.append(["都市銀行", "金融庁", "東京都", "株式会社テスト銀行", "1000012010001", "100-0001", "東京都千代田区丸の内1-1-1"])
+
+    ws2 = wb.create_sheet("地方銀行")
+    ws2.append(["業態", "所管", "都道府県", "銀行名", "法人番号", "郵便番号", "本店等所在地"])
+    ws2.append(["地方銀行", "関東財務局", "神奈川県", "株式会社横浜テスト銀行", "2000012010002", "220-0001", "神奈川県横浜市西区1-1-1"])
+    wb.save(xlsx_path)
+
+    records = load_fsa_excel_permits(xlsx_path, permit_category="銀行", prefecture_filter=None)
+    assert len(records) == 2
+    assert {r.permit_id for r in records} == {"FSA-ginkou-1000012010001", "FSA-ginkou-2000012010002"}

@@ -16,13 +16,16 @@ from jp_opendata.normalizer import (
 )
 
 # 国税庁全件CSV（ヘッダ無し30列）の主要列インデックス
-# 1: corporateNumber, 6: name, 9: prefectureName, 10: cityName, 11: streetNumber, 13: postCode
+# 1: corporateNumber, 2: process (21=閉鎖等), 6: name, 9: prefectureName,
+# 10: cityName, 11: streetNumber, 13: postCode, 18: closeDate
 NTA_IDX_CORP_NUM = 1
+NTA_IDX_PROCESS = 2
 NTA_IDX_NAME = 6
 NTA_IDX_PREF = 9
 NTA_IDX_CITY = 10
 NTA_IDX_STREET = 11
 NTA_IDX_POSTCODE = 13
+NTA_IDX_CLOSE_DATE = 18
 
 
 CORPORATES_SCHEMA: dict[str, pl.DataType] = {
@@ -30,6 +33,9 @@ CORPORATES_SCHEMA: dict[str, pl.DataType] = {
     "company_name": pl.String,
     "norm_name": pl.String,
     "core_name": pl.String,
+    "process_code": pl.String,
+    "is_closed": pl.Boolean,
+    "close_date": pl.String,
     "prefecture": pl.String,
     "municipality": pl.String,
     "post_code": pl.String,
@@ -86,6 +92,10 @@ def load_nta_corporates(
         if not name:
             continue
 
+        process_code = rec[NTA_IDX_PROCESS].strip() if len(rec) > NTA_IDX_PROCESS else ""
+        close_date = rec[NTA_IDX_CLOSE_DATE].strip() if len(rec) > NTA_IDX_CLOSE_DATE else ""
+        is_closed = process_code == "21" or bool(close_date)
+
         pref = rec[NTA_IDX_PREF].strip()
         city = rec[NTA_IDX_CITY].strip()
         street = rec[NTA_IDX_STREET].strip()
@@ -98,6 +108,9 @@ def load_nta_corporates(
                 "company_name": name,
                 "norm_name": normalize_company_name(name, strip_legal_form=False),
                 "core_name": normalize_company_name(name, strip_legal_form=True),
+                "process_code": process_code,
+                "is_closed": is_closed,
+                "close_date": close_date,
                 "prefecture": addr.prefecture or pref,
                 "municipality": addr.municipality or city,
                 "post_code": rec[NTA_IDX_POSTCODE].strip(),
@@ -128,6 +141,9 @@ def build_corporates_from_records(records: list[dict[str, object]]) -> pl.DataFr
                 "company_name": name,
                 "norm_name": normalize_company_name(name, strip_legal_form=False),
                 "core_name": normalize_company_name(name, strip_legal_form=True),
+                "process_code": str(rec.get("process_code") or "01"),
+                "is_closed": bool(rec.get("is_closed", False)),
+                "close_date": str(rec.get("close_date") or ""),
                 "prefecture": str(rec.get("prefecture") or addr.prefecture),
                 "municipality": str(rec.get("municipality") or addr.municipality),
                 "post_code": str(rec.get("post_code") or ""),

@@ -36,3 +36,19 @@ def test_normalize_address_kanji_and_hyphens() -> None:
     assert res1.municipality == "千代田区"
     assert res1.normalized == "東京都千代田区霞が関3-1-1"
     assert res1.street_key == res2.street_key == "東京都千代田区霞が関3-1-1"
+
+
+def test_normalize_address_preserves_katakana_choon_and_handles_no_connector() -> None:
+    from jp_opendata.normalizer import strip_address_oaza_variants
+
+    res_akita = normalize_address("秋田県南秋田郡井川町井内字杉ケ崎１番地の５")
+    assert res_akita.street_key == "秋田県南秋田郡井川町井内字杉ケ崎1-5"
+    variants = strip_address_oaza_variants(res_akita.street_key)
+    assert "秋田県南秋田郡井川町井内" in variants
+
+    res_bldg = normalize_address("秋田県北秋田市住吉町４番２３号鷹巣スポーツビル７号室")
+    assert "スポーツビル" in res_bldg.normalized
+
+    res_nagasaki = normalize_address("長崎県雲仙市国見町多比良乙２７３番地")
+    n_variants = strip_address_oaza_variants(res_nagasaki.street_key)
+    assert "長崎県雲仙市国見町多比良" in n_variants
