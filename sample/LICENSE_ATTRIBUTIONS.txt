@@ -1,4 +1,4 @@
-jp-opendata-db All-Japan Full Package (v2)
+jp-opendata-db Sample Package (v2)
 加工主体: TerseLogic (https://terselogic.com/)
 本データベースは下記の公的オープンデータを正規化・名寄せ・空間結合して TerseLogic が独自に編集・加工したものです（各府省が作成した未加工データではありません）。
 

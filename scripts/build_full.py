@@ -193,16 +193,16 @@ def build_tokyo_full(root: Path, mhlw_limit: int = 8) -> Path:
     dist_dir.mkdir(parents=True, exist_ok=True)
 
     nta_zips = download_nta_tokyo_zips(raw_dir)
-    l01_zip = download_file(MLIT_L01_TOKYO_URL, raw_dir / "L01-25_13_GML.zip")
+    l01_zip = download_file(MLIT_L01_TOKYO_URL, raw_dir / "L01-26_13_GML.zip")
     isj_gaiku_zip = download_file(MLIT_ISJ_GAIKU_TOKYO_URL, raw_dir / "13000-24.0a.zip")
-    isj_oaza_zip = download_file(MLIT_ISJ_OAZA_TOKYO_URL, raw_dir / "13000-18.0b.zip")
+    isj_oaza_zip = download_file(MLIT_ISJ_OAZA_TOKYO_URL, raw_dir / "13000-19.0b.zip")
 
     print("Loading NTA Tokyo corporates (all split archives)...")
     corps_df = pl.concat([load_nta_corporates(z, limit=None) for z in nta_zips]).unique(
         subset=["corporate_number"], keep="first"
     )
 
-    print("Geocoding ALL corporates with MLIT ISJ (gaiku 24.0a + oaza 18.0b)...")
+    print("Geocoding ALL corporates with MLIT ISJ (gaiku 24.0a + oaza 19.0b)...")
     corps_geo = geocode_corporates_with_isj(corps_df, isj_gaiku_zip, isj_oaza_zip)
     geo_count = corps_geo.filter(pl.col("latitude").is_not_null()).height
     print(f"Geocoded: {geo_count:,} / {corps_geo.height:,} ({geo_count / corps_geo.height:.1%})")
@@ -236,47 +236,58 @@ def build_tokyo_full(root: Path, mhlw_limit: int = 8) -> Path:
     edinet_parquet = root.parent / "edinet-pit-dataset" / "data" / "out" / "edinet_pit_cohort.parquet"
     edinet_df = build_edinet_bridge(edinet_parquet, corps_geo)
 
+    from datetime import date as _date
+
+    retrieved_today = _date.today().isoformat()
     sources_df = pl.DataFrame(
         [
             {
                 "source_id": "nta_corp",
-                "source_name": "国税庁法人番号公表サイト（東京都）",
+                "source_name": "国税庁法人番号公表サイト（東京都・閉鎖区分含む）を加工して作成",
                 "publisher": "国税庁",
-                "license_name": "公共データ利用規約（第1.0版）",
+                "license_name": "公共データ利用規約（第1.0版 / PDL1.0）",
                 "source_url": NTA_ZENKEN_URL,
-                "retrieved_date": "2026-11-18",
+                "retrieved_date": retrieved_today,
             },
             {
                 "source_id": "mlit_isj",
-                "source_name": "国土交通省 位置参照情報（街区24.0a・大字町丁目18.0b 東京都）",
+                "source_name": "国土交通省 位置参照情報（街区24.0a・大字町丁目19.0b 東京都）を加工して作成",
                 "publisher": "国土交通省",
-                "license_name": "位置参照情報利用約款（商用・有償二次配布可）",
+                "license_name": "位置参照情報利用約款（出典・加工表示の上で商用・有償二次配布可）",
                 "source_url": "https://nlftp.mlit.go.jp/isj/",
-                "retrieved_date": "2026-11-18",
+                "retrieved_date": retrieved_today,
             },
             {
                 "source_id": "mlit_l01",
-                "source_name": "国土数値情報 地価公示データ（東京都 L01-25）",
+                "source_name": "国土数値情報 地価公示データ（東京都 L01-26 / 令和8年版）を加工して作成",
                 "publisher": "国土交通省",
                 "license_name": "国土数値情報利用約款（L01商用可）",
                 "source_url": MLIT_L01_TOKYO_URL,
-                "retrieved_date": "2026-11-18",
+                "retrieved_date": retrieved_today,
             },
             {
                 "source_id": "mhlw_kaigo",
-                "source_name": "介護サービス情報公表システム オープンデータ（複数サービス種別）",
+                "source_name": "介護サービス情報公表システム オープンデータ（複数サービス種別）を加工して作成",
                 "publisher": "厚生労働省",
                 "license_name": "CC BY 4.0 / 厚生労働省利用規約",
                 "source_url": MHLW_OPENDATA_PAGE,
-                "retrieved_date": "2026-11-18",
+                "retrieved_date": retrieved_today,
             },
             {
                 "source_id": "fsa_menkyo",
-                "source_name": "免許・許可・登録等を受けている業者一覧（金融庁Excel一括）",
+                "source_name": "免許・許可・登録等を受けている業者一覧（金融庁Excel一括・全8業種）を加工して作成",
                 "publisher": "金融庁",
-                "license_name": "政府標準利用規約（第2.0版）準拠",
+                "license_name": "公共データ利用規約（第1.0版 / PDL1.0）",
                 "source_url": "https://www.fsa.go.jp/menkyo/menkyo.html",
-                "retrieved_date": "2026-11-18",
+                "retrieved_date": retrieved_today,
+            },
+            {
+                "source_id": "fsa_edinet",
+                "source_name": "金融庁 EDINET 提出者コード一覧・有価証券報告書データを加工して作成",
+                "publisher": "金融庁",
+                "license_name": "公共データ利用規約（第1.0版 / PDL1.0）",
+                "source_url": "https://disclosure2.edinet-fsa.go.jp/",
+                "retrieved_date": retrieved_today,
             },
         ],
         schema=SOURCES_METADATA_SCHEMA,

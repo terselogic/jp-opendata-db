@@ -52,3 +52,21 @@ def test_normalize_address_preserves_katakana_choon_and_handles_no_connector() -
     res_nagasaki = normalize_address("長崎県雲仙市国見町多比良乙２７３番地")
     n_variants = strip_address_oaza_variants(res_nagasaki.street_key)
     assert "長崎県雲仙市国見町多比良" in n_variants
+
+
+def test_normalize_address_special_municipalities_and_sapporo_jo() -> None:
+    assert normalize_address("三重県四日市市諏訪町1番5号").municipality == "四日市市"
+    assert normalize_address("長崎県大村市玖島1丁目25番地").municipality == "大村市"
+    assert normalize_address("佐賀県杵島郡大町町大字大町5017番地").municipality == "杵島郡大町町"
+    assert normalize_address("広島県廿日市市下平良1丁目11番1号").municipality == "廿日市市"
+    assert normalize_address("東京都町田市森野2丁目2番22号").municipality == "町田市"
+
+    e = normalize_address("北海道札幌市中央区北四条東２丁目８番地６")
+    w = normalize_address("北海道札幌市中央区北四条西１２丁目１番２８号")
+    assert e.municipality == "札幌市中央区"
+    assert w.municipality == "札幌市中央区"
+    assert e.street_key == "北海道札幌市中央区北4条東2-8-6"
+    assert w.street_key == "北海道札幌市中央区北4条西12-1-28"
+    assert e.street_key != w.street_key
+
+    assert normalize_address("東京都渋谷区道玄坂百二十三番地").street_key == "東京都渋谷区道玄坂123"

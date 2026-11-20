@@ -72,7 +72,15 @@ PREFECTURE_RE = re.compile(
 )
 
 MUNICIPALITY_RE = re.compile(
-    r"^([^\s]+?(?:市[^\s]+?区|市|区|町|村))"
+    r"^("
+    r"[^\s]+?郡(?:[^\s]+?(?:町町|村村)|[^\s]+?[町村])"
+    r"|(?:四日市|廿日市|野々市)市"
+    r"|[^\s]+?市[^\s]+?区"
+    r"|[^\s]+?市"
+    r"|[^\s]+?区"
+    r"|[^\s]+?(?:町町|村村)"
+    r"|[^\s]+?[町村]"
+    r")"
 )
 
 KANJI_DIGIT_MAP: dict[str, int] = {
@@ -89,10 +97,11 @@ KANJI_DIGIT_MAP: dict[str, int] = {
     "九": 9,
 }
 
-HYPHEN_RE = re.compile(r"[−―‐－−]+")
+HYPHEN_RE = re.compile(r"[−―‐－—─]+")
 DIGIT_CHOON_RE = re.compile(r"(?<=\d)ー(?=\d)")
-TRAILING_CHOON_DIGIT_RE = re.compile(r"(?<=\d)ー(?=[0-9一二三四五六七八九十])")
-CHOME_RE = re.compile(r"([0-9一二三四五六七八九十〇零]+)\s*(?:丁目|番地|番|号|条|線)")
+TRAILING_CHOON_DIGIT_RE = re.compile(r"(?<=\d)ー(?=[0-9一二三四五六七八九十百])")
+JO_SEN_RE = re.compile(r"([0-9一二三四五六七八九十百〇零]+)\s*(条|線)")
+CHOME_RE = re.compile(r"([0-9一二三四五六七八九十百〇零]+)\s*(?:丁目|番地|番|号)")
 NO_CONNECTOR_RE = re.compile(r"(\d+)-?の(\d+)")
 TRAILING_NUM_RE = re.compile(r"[\d-]+$")
 KANJI_BRANCH_RE = re.compile(r"[甲乙丙丁戊己庚辛壬癸]$")
@@ -132,11 +141,23 @@ def is_valid_corporate_number(corp_num: str) -> bool:
 def _kanji_num_to_int(token: str) -> str:
     if token.isdigit():
         return token
-    if "十" in token:
-        parts = token.split("十", 1)
-        tens = KANJI_DIGIT_MAP.get(parts[0], 1) if parts[0] else 1
-        ones = KANJI_DIGIT_MAP.get(parts[1], 0) if parts[1] else 0
-        return str(tens * 10 + ones)
+    if "百" in token or "十" in token:
+        total = 0
+        rem = token
+        if "百" in rem:
+            h_part, rem = rem.split("百", 1)
+            hundreds = KANJI_DIGIT_MAP.get(h_part, 1) if h_part else 1
+            total += hundreds * 100
+        if "十" in rem:
+            t_part, rem = rem.split("十", 1)
+            tens = KANJI_DIGIT_MAP.get(t_part, 1) if t_part else 1
+            total += tens * 10
+        if rem:
+            if rem in KANJI_DIGIT_MAP:
+                total += KANJI_DIGIT_MAP[rem]
+            elif rem.isdigit():
+                total += int(rem)
+        return str(total)
     digits = [str(KANJI_DIGIT_MAP[c]) for c in token if c in KANJI_DIGIT_MAP]
     return "".join(digits) if len(digits) == len(token) else token
 
@@ -167,11 +188,17 @@ def normalize_address(raw_address: str) -> NormalizedAddress:
         prefecture = pref_match.group(1)
         rest = rest[len(prefecture) :]
 
+    # 条・線は区切りを残しつつ漢数字のみアラビア数字へ統一（札幌市等の東西・丁目崩壊を防止）
+    def _replace_jo_sen(match: re.Match[str]) -> str:
+        num = _kanji_num_to_int(match.group(1))
+        return f"{num}{match.group(2)}"
+
     # 丁目・番地・号をハイフン区切りのアラビア数字に統一
     def _replace_chome(match: re.Match[str]) -> str:
         num = _kanji_num_to_int(match.group(1))
         return f"{num}-"
 
+    rest = JO_SEN_RE.sub(_replace_jo_sen, rest)
     rest = CHOME_RE.sub(_replace_chome, rest)
     rest = NO_CONNECTOR_RE.sub(r"\1-\2", rest)
     rest = re.sub(r"-+", "-", rest).strip("-")
@@ -183,7 +210,9 @@ def normalize_address(raw_address: str) -> NormalizedAddress:
 
     normalized = f"{prefecture}{rest}"
     # ビル名・階数を落とした番地末尾までのコアキー（名寄せの頑健性向上）
-    street_match = re.match(r"^([^\d-]+(?:\d+(?:-\d+)*)?)", rest)
+    street_match = re.match(
+        r"^((?:[^\d-]+|\d+(?:条|線)[東西南北]?)+(?:\d+(?:-\d+)*)?)", rest
+    )
     street_key = street_match.group(1) if street_match else rest
     return NormalizedAddress(
         prefecture=prefecture,
